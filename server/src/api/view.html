@@ -1,0 +1,166 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>simpool live view</title>
+<style>
+  :root { color-scheme: light dark; font: 13px -apple-system, system-ui, sans-serif; }
+  body { margin: 0; display: flex; gap: 16px; padding: 16px; align-items: flex-start; }
+  #wrap { position: relative; flex: none; }
+  canvas { display: block; border-radius: 28px; box-shadow: 0 2px 16px rgba(0,0,0,.25); cursor: crosshair; background: #000; }
+  #overlay { position: absolute; inset: 0; pointer-events: none; }
+  #overlay div { position: absolute; border: 1px solid rgba(255,60,60,.8); }
+  #overlay div.hot { background: rgba(255,60,60,.18); }
+  #side { display: flex; flex-direction: column; gap: 8px; min-width: 260px; max-width: 420px; }
+  button { font: inherit; padding: 4px 10px; }
+  .row { display: flex; gap: 6px; flex-wrap: wrap; }
+  #status { color: #888; }
+  #el { white-space: pre-wrap; font: 12px ui-monospace, monospace; }
+  #err { color: #d33; white-space: pre-wrap; }
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="screen" tabindex="0"></canvas><div id="overlay"></div></div>
+<div id="side">
+  <div id="status">connecting…</div>
+  <div class="row">
+    <button data-button="home">Home</button>
+    <button data-button="lock">Lock</button>
+    <button data-button="siri">Siri</button>
+    <button id="shot">Screenshot</button>
+  </div>
+  <div class="row">
+    <label><input type="checkbox" id="inspect"> Inspect accessibility (hover)</label>
+  </div>
+  <div class="row"><input id="url" placeholder="open URL / deep link" style="flex:1"><button id="go">Open</button></div>
+  <div>Click and drag to touch. Type with the canvas focused. Alt-drag pinches around the center.</div>
+  <div id="el"></div>
+  <div id="err"></div>
+</div>
+<script>
+const params = new URLSearchParams(location.search);
+const token = params.get('token');
+const base = location.pathname.replace(/\/view$/, '');
+const q = (extra = {}) => { const p = new URLSearchParams(extra); if (token) p.set('token', token); return p.toString(); };
+const headers = token ? { Authorization: 'Bearer ' + token } : {};
+const canvas = document.getElementById('screen'), ctx = canvas.getContext('2d');
+const overlay = document.getElementById('overlay');
+let points = { width: 402, height: 874 }, ws, down = false, lastMove = 0, elements = [];
+
+function fit() {
+  const h = Math.min(window.innerHeight - 32, 900);
+  canvas.style.height = h + 'px';
+  canvas.style.width = (h * points.width / points.height) + 'px';
+}
+window.addEventListener('resize', fit);
+
+function connect() {
+  ws = new WebSocket((location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + base + '/screen/ws?' + q({ fps: params.get('fps') || 30, scale: params.get('scale') || 0.5 }));
+  ws.binaryType = 'blob';
+  ws.onmessage = async (m) => {
+    if (typeof m.data === 'string') {
+      const msg = JSON.parse(m.data);
+      if (msg.type === 'info') {
+        points = msg.device.points;
+        document.getElementById('status').textContent = `${msg.device.device_type} · ${msg.device.runtime} · ${points.width}×${points.height} pt`;
+        fit();
+      } else if (msg.error) {
+        document.getElementById('err').textContent = msg.error;
+      }
+      return;
+    }
+    const bmp = await createImageBitmap(m.data);
+    if (canvas.width !== bmp.width) { canvas.width = bmp.width; canvas.height = bmp.height; }
+    ctx.drawImage(bmp, 0, 0);
+  };
+  ws.onclose = () => { document.getElementById('status').textContent = 'disconnected; retrying…'; setTimeout(connect, 1000); };
+}
+connect();
+
+const send = (a) => ws && ws.readyState === 1 && ws.send(JSON.stringify(a));
+const toPt = (e) => {
+  const r = canvas.getBoundingClientRect();
+  return { x: (e.clientX - r.left) / r.width * points.width, y: (e.clientY - r.top) / r.height * points.height };
+};
+function pinchPair(p) {
+  const c = { x: points.width / 2, y: points.height / 2 };
+  return { x: p.x, y: p.y, x2: 2 * c.x - p.x, y2: 2 * c.y - p.y };
+}
+canvas.addEventListener('mousedown', (e) => {
+  canvas.focus(); down = true;
+  const p = toPt(e);
+  send({ type: 'touch', phase: 'down', ...(e.altKey ? pinchPair(p) : p) });
+});
+window.addEventListener('mousemove', (e) => {
+  if (down) {
+    const now = performance.now();
+    if (now - lastMove < 18) return; // the simulator drops moves closer than ~16ms
+    lastMove = now;
+    const p = toPt(e);
+    send({ type: 'touch', phase: 'move', ...(e.altKey ? pinchPair(p) : p) });
+  } else if (document.getElementById('inspect').checked) {
+    hover(toPt(e));
+  }
+});
+window.addEventListener('mouseup', (e) => {
+  if (!down) return;
+  down = false;
+  const p = toPt(e);
+  send({ type: 'touch', phase: 'up', ...(e.altKey ? pinchPair(p) : p) });
+  if (document.getElementById('inspect').checked) setTimeout(loadTree, 600);
+});
+canvas.addEventListener('wheel', (e) => {
+  e.preventDefault();
+  if (Math.abs(e.deltaY) < 20) return;
+  send({ type: 'scroll', direction: e.deltaY > 0 ? 'down' : 'up', distance: Math.min(Math.abs(e.deltaY) * 2, points.height * 0.5), ...toPt(e) });
+}, { passive: false });
+
+const named = { Enter: 'enter', Backspace: 'backspace', Tab: 'tab', Escape: 'escape', ArrowUp: 'up', ArrowDown: 'down', ArrowLeft: 'left', ArrowRight: 'right', Delete: 'forward_delete', Home: 'home', End: 'end', PageUp: 'page_up', PageDown: 'page_down' };
+canvas.addEventListener('keydown', (e) => {
+  const mods = [];
+  if (e.metaKey) mods.push('cmd');
+  if (e.ctrlKey) mods.push('ctrl');
+  if (e.altKey) mods.push('alt');
+  if (named[e.key]) send({ type: 'key', key: named[e.key], modifiers: e.shiftKey ? [...mods, 'shift'] : mods });
+  else if (e.key.length === 1 && mods.length) send({ type: 'key', key: e.key.toLowerCase(), modifiers: e.shiftKey ? [...mods, 'shift'] : mods });
+  else if (e.key.length === 1) send({ type: 'text', text: e.key });
+  else return;
+  e.preventDefault();
+});
+
+document.querySelectorAll('[data-button]').forEach((b) => b.onclick = () => send({ type: 'button', button: b.dataset.button }));
+document.getElementById('shot').onclick = () => window.open(base + '/screenshot?' + q());
+document.getElementById('go').onclick = () => fetch(base + '/open-url', { method: 'POST', headers: { ...headers, 'Content-Type': 'application/json' }, body: JSON.stringify({ url: document.getElementById('url').value }) })
+  .then(async (r) => { document.getElementById('err').textContent = r.ok ? '' : (await r.json()).error; });
+
+async function loadTree() {
+  const r = await fetch(base + '/ui?' + q({ format: 'flat' }), { headers });
+  if (!r.ok) { document.getElementById('err').textContent = (await r.json()).error; return; }
+  elements = (await r.json()).elements.filter((e) => e.depth > 0);
+  drawBoxes(null);
+}
+function drawBoxes(hot) {
+  overlay.innerHTML = '';
+  if (!document.getElementById('inspect').checked) return;
+  const sx = canvas.clientWidth / points.width, sy = canvas.clientHeight / points.height;
+  for (const e of elements) {
+    const d = document.createElement('div');
+    d.style.left = e.frame.x * sx + 'px'; d.style.top = e.frame.y * sy + 'px';
+    d.style.width = e.frame.width * sx + 'px'; d.style.height = e.frame.height * sy + 'px';
+    if (e === hot) d.className = 'hot';
+    overlay.appendChild(d);
+  }
+}
+function hover(p) {
+  // Smallest element under the pointer.
+  const hits = elements.filter((e) => p.x >= e.frame.x && p.y >= e.frame.y && p.x <= e.frame.x + e.frame.width && p.y <= e.frame.y + e.frame.height);
+  hits.sort((a, b) => a.frame.width * a.frame.height - b.frame.width * b.frame.height);
+  const e = hits[0];
+  drawBoxes(e);
+  const { depth, ...shown } = e || {};
+  document.getElementById('el').textContent = e ? JSON.stringify(shown, null, 1) : '';
+}
+document.getElementById('inspect').onchange = (e) => e.target.checked ? loadTree() : drawBoxes(null);
+</script>
+</body>
+</html>

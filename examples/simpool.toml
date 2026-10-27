@@ -1,0 +1,37 @@
+# simpoold config. Paths are relative to this file.
+
+listen = "0.0.0.0:7700"
+# Bearer tokens clients must send. Generate with `openssl rand -hex 24`.
+tokens = ["change-me"]
+
+# Simulators running at once on this Mac, across all profiles (~0.75 GB RAM each when slim).
+max_devices = 6
+# A lease expires after this long with no requests (open streams count as activity).
+lease_idle_secs = 600
+# Hard cap on any lease, renewals included.
+lease_max_secs = 14400
+# Default time a lease request waits in the queue when the pool is full.
+acquire_wait_secs = 120
+
+# Let clients send their own simfast config (it must still match this Mac's pins).
+allow_client_configs = true
+# POST /spawn runs any binary inside the simulator, as this Mac's user.
+allow_spawn = false
+# /tunnel and /reverse reach arbitrary loopback ports on this Mac.
+allow_tunnels = true
+
+# simfast = "/Users/ci/.cargo/bin/simfast"
+# data_dir = "/Users/ci/Library/Application Support/simpool"
+
+# Each profile is a simfast config. Create one on this Mac with
+#   simfast init "iPhone 17 Pro" -c profiles/iphone.toml --name pool-iphone
+# and set `spares` there to how many leases you expect at once: a lease thaws a
+# frozen spare in ~1s; without one it boots cold (~20s).
+[profiles.iphone]
+config = "profiles/iphone.toml"
+description = "iPhone 17 Pro, newest iOS, slim"
+
+[profiles.ipad]
+config = "profiles/ipad.toml"
+max = 2
+description = "iPad Pro 13-inch"
