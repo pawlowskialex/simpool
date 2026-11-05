@@ -4,13 +4,29 @@ use crate::Client;
 use anyhow::{bail, Context, Result};
 use futures::{SinkExt, StreamExt};
 use std::collections::HashMap;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::Message;
 
-type Ws = tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<TcpStream>>;
+/// A connection to the server: TCP, or a Unix socket.
+trait Conn: AsyncRead + AsyncWrite + Unpin + Send {}
+impl<T: AsyncRead + AsyncWrite + Unpin + Send> Conn for T {}
+
+type Ws = tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<Box<dyn Conn>>>;
+
+#[cfg(unix)]
+async fn dial_unix(c: &Client) -> Result<Option<Box<dyn Conn>>> {
+    let Some(sock) = &c.unix else { return Ok(None) };
+    let stream = tokio::net::UnixStream::connect(sock).await.with_context(|| format!("connecting to {}", sock.display()))?;
+    Ok(Some(Box::new(stream)))
+}
+
+#[cfg(not(unix))]
+async fn dial_unix(_: &Client) -> Result<Option<Box<dyn Conn>>> {
+    Ok(None)
+}
 
 async fn connect(c: &Client, path: &str) -> Result<Ws> {
     let url = c.url(path).replacen("http://", "ws://", 1).replacen("https://", "wss://", 1);
@@ -18,7 +34,18 @@ async fn connect(c: &Client, path: &str) -> Result<Ws> {
     if let Some(t) = &c.token {
         req.headers_mut().insert("authorization", format!("Bearer {t}").parse()?);
     }
-    match tokio_tungstenite::connect_async(req).await {
+    let stream: Box<dyn Conn> = match dial_unix(c).await? {
+        Some(stream) => stream,
+        None => {
+            let uri = req.uri();
+            let host = uri.host().unwrap_or_default().trim_matches(['[', ']']).to_string();
+            let port = uri.port_u16().unwrap_or(if uri.scheme_str() == Some("wss") { 443 } else { 80 });
+            let tcp = TcpStream::connect((host.as_str(), port)).await.with_context(|| format!("connecting to {url}"))?;
+            tcp.set_nodelay(true)?;
+            Box::new(tcp)
+        }
+    };
+    match tokio_tungstenite::client_async_tls(req, stream).await {
         Ok((ws, _)) => Ok(ws),
         Err(tokio_tungstenite::tungstenite::Error::Http(resp)) => {
             let body = resp.body().as_ref().map(|b| String::from_utf8_lossy(b).to_string()).unwrap_or_default();
@@ -72,6 +99,24 @@ async fn pipe(ws: Ws, tcp: TcpStream) {
         let _ = wr.shutdown().await;
     };
     tokio::join!(up, down);
+}
+
+/// Passes each local TCP connection to the server's Unix socket untouched, for browsers, which
+/// can't speak to a socket themselves.
+#[cfg(unix)]
+pub async fn serve_socket_proxy(listener: TcpListener, sock: std::path::PathBuf) -> Result<()> {
+    loop {
+        let (mut tcp, _) = listener.accept().await?;
+        let sock = sock.clone();
+        tokio::spawn(async move {
+            match tokio::net::UnixStream::connect(&sock).await {
+                Ok(mut server) => {
+                    let _ = tokio::io::copy_bidirectional(&mut tcp, &mut server).await;
+                }
+                Err(e) => eprintln!("simpool: connecting to {}: {e}", sock.display()),
+            }
+        });
+    }
 }
 
 const OPEN: u8 = 0;

@@ -49,6 +49,52 @@ profiles/NAME.toml` once so the first lease doesn't pay for the template build.
 `simpoold` writes its lease list to `data_dir/leases.json`. After a crash or `kill -9`, it stops the
 orphaned simulators on the next start. On SIGINT/SIGTERM it releases every lease.
 
+## Pool on your Mac, client in a VM
+
+The client runs on Linux too. To reach the pool without opening a port, set `listen_unix` in
+`simpool.toml` and forward that socket over SSH:
+
+```sh
+# on the Mac
+ssh -N -R /tmp/simpool.sock:"$HOME/simpool/simpoold.sock" vm
+
+# in the VM
+export SIMPOOL_URL=unix:///tmp/simpool.sock SIMPOOL_TOKEN=…
+export SIMPOOL_LEASE=$(simpool lease --ttl 28800)
+simpool install build/MyApp.app
+simpool debug com.example.MyApp            # symbols come from the dSYMs install sent
+simpool view                               # keeps running; open the URL it prints
+```
+
+- If the forward fails, check the VM's `sshd_config`: `AllowStreamLocalForwarding` must be on, and
+  some distros (Alpine) also need `AllowTcpForwarding yes`. Set `StreamLocalBindUnlink yes` so a
+  reconnect can replace the old socket.
+- The socket is mode 0600 on the Mac, and `ssh` creates the VM's end the same way. Tokens still apply.
+- A browser can't use a Unix socket, so `simpool view` serves the view on a local port for as long
+  as it runs. Anyone else on the VM could reach that port, so keep a token set if that matters. It
+  also prints the URL for a browser on the Mac itself.
+
+## Installing
+
+`simpool install X.app` sends a manifest of file hashes, then only the files the server doesn't
+have. Contents are kept in `data_dir/blobs`, shared by every lease, so a reinstall or a new lease
+sends just what changed, and an interrupted upload resumes. Changes count per file: a rebuilt binary
+is sent whole. The store is trimmed to `blob_cache_gb`, least recently used first.
+
+An `.ipa`, zip or tarball is uploaded whole every time, so prefer the directory.
+
+Bundles can be read-only (Bazel and Nix outputs are); they're made writable before `simctl install`,
+which otherwise fails with EACCES. A symlink that leaves the bundle is sent as what it points at.
+
+**Debugging needs dSYMs.** `lldb-dap` runs on the Mac, so it can't read symbols from the client's
+disk, or the `.o` files a plain `dwarf` build points at. `simpool install` also sends any dSYM next
+to the app or named with `--dsym`: `MyApp.app.dSYM`, `Foo.framework.dSYM`, `Ext.appex.dSYM`. Build
+them with `DEBUG_INFORMATION_FORMAT=dwarf-with-dsym` in Xcode or `--apple_generate_dsym` in Bazel.
+
+The server puts each dSYM beside what it describes, because that's the only place `lldb` looks:
+next to the app in its container, or inside the installed app's `Frameworks/` and `PlugIns/`. Source
+paths in the DWARF are those of the machine that built the app.
+
 ## Leases
 
 `POST /v1/leases` with `{"profile": "iphone"}`, or `{"simfast_config": "<toml>"}` if
@@ -57,9 +103,19 @@ when full; `0` fails fast with 503), and `label` (shown in listings, e.g. a CI j
 
 - Capacity is `max_devices` overall, and `max` per profile. Waiting requests are served FIFO.
 - Any request on a lease counts as activity. While a stream is open (live view, logs, tunnels,
-  debugger), the lease never idles out. `lease_max_secs` is a hard cap.
+  debugger) or an install is running, the lease never idles out. `lease_max_secs` is a hard cap, 24
+  hours by default; `0` turns it off.
 - `DELETE /v1/leases/{id}` releases the lease. It kills the lease's debuggers, recorders and
   streams, and runs `simfast stop`. Every lease is a fresh simulator.
+
+For a long coding session, where the simulator can sit unused for a while, either:
+
+- Ask for a long idle timeout: `simpool lease --ttl 28800`. Simple, but the simulator stays held for
+  that long if you forget to release it.
+- Run `simpool keepalive` in the background. It renews until stopped and retries through network
+  drops, so if the VM goes away the lease idles out on its normal timeout.
+
+Restarting `simpoold` still ends every lease.
 
 ## API
 
@@ -73,7 +129,10 @@ origin top-left, the same units as the accessibility frames. `GET …/device` gi
 | | |
 |---|---|
 | `GET /apps[?user=true]` | Installed apps, with data and group container paths |
-| `POST /apps` | Body is a zipped `.app`, an `.ipa` or a tar(.gz). Installs it and returns the bundle id. `simpool install X.app` zips for you. |
+| `POST /apps` | Body is a zipped `.app`, an `.ipa` or a tar(.gz). Installs it and returns the bundle id. |
+| `POST /apps/manifest` | `{"name": "My.app", "dirs": […], "files": [{"path", "sha256", "size", "executable"}], "symlinks": [{"path", "target"}]}`. Installs it, or answers `{"missing": [hash, …]}`; send those to `/blobs` and post again. This is what `simpool install X.app` uses. |
+| `POST /blobs` | Body is any number of `[sha256: 32 bytes][length: u64 BE][contents]` frames. Each is verified and kept as soon as it arrives. |
+| `POST /apps/{bundle}/dsyms` | A manifest of a `.dSYM`. Same `missing` exchange; places it where `lldb` will find it. Send it again after each install; `simpool install` does. |
 | `GET/DELETE /apps/{bundle}` | Info / uninstall |
 | `POST /apps/{bundle}/launch` | `{"args", "env", "wait_for_debugger", "terminate_existing", "capture_output"}` → `{"pid"}` |
 | `POST /apps/{bundle}/terminate` | |
@@ -116,7 +175,7 @@ identifier and placeholder), `enabled`, and `index`.
 | `GET /screenshot?format=png\|jpeg&scale=&quality=` | From the framebuffer, ~15–100ms |
 | `GET /screen/ws?fps=&scale=&quality=` | WebSocket. The server sends JPEG frames when the screen changes, at least once a second. The client sends input actions as JSON text (same shapes as `/input`). |
 | `GET /screen/mjpeg` | `multipart/x-mixed-replace`, for `<img>` tags and video tools |
-| `GET /view` | Browser live view: click/drag to touch, keyboard, buttons, wheel scroll, alt-drag to pinch, and an accessibility inspector overlay. `simpool view` opens it. |
+| `GET /view` | Browser live view: click/drag to touch, keyboard, buttons, wheel scroll, alt-drag to pinch, and an accessibility inspector overlay. `simpool view` prints the URL, and also opens it on a Mac when not over SSH. |
 | `POST /recordings` → `POST /recordings/{id}/stop` | H.264/HEVC MP4 via `simctl io recordVideo`. Stop returns the file. |
 
 **Device**

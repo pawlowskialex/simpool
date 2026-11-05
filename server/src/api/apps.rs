@@ -2,8 +2,9 @@
 
 use super::{save_body, scratch, AppState, L};
 use crate::error::{ApiError, ApiResult};
+use crate::fsutil::{blocking, make_writable, remove_tree};
 use crate::pool::Lease;
-use crate::proc::{self, plist_to_json, simctl, simctl_with};
+use crate::proc::{self, plist_to_json, simctl, simctl_timeout, simctl_with};
 use axum::body::Body;
 use axum::extract::{Path, Query};
 use axum::http::{header, StatusCode};
@@ -75,37 +76,64 @@ async fn app_info(L(lease): L, Path(p): Path<HashMap<String, String>>) -> ApiRes
     installed(&lease).await?.remove(bundle).map(Json).ok_or_else(|| ApiError::not_found(format!("{bundle} isn't installed")))
 }
 
+/// How long extracting and installing `bytes` of app may take. Grows with the size, so a huge app
+/// has time to finish while a stuck tool still gets killed eventually.
+fn install_timeout(bytes: u64) -> Duration {
+    Duration::from_secs(600 + bytes / (2 << 20))
+}
+
 /// Body: a zipped .app (`ditto -c -k --keepParent X.app x.zip`), an .ipa, or a tar(.gz) of a .app.
 async fn install(L(lease): L, body: Body) -> ApiResult<Json<Value>> {
+    let _hold = lease.hold();
     let upload = scratch(&lease, "upload");
-    save_body(body, &upload).await?;
+    let bytes = save_body(body, &upload).await?;
     let dest = scratch(&lease, "app");
     tokio::fs::create_dir_all(&dest).await?;
     let mut magic = [0u8; 512];
     let n = tokio::fs::File::open(&upload).await?.read(&mut magic).await?;
+    let timeout = install_timeout(bytes);
     let res = async {
         if magic[..n].starts_with(b"PK\x03\x04") {
-            proc::run("ditto", ["-x".as_ref(), "-k".as_ref(), upload.as_os_str(), dest.as_os_str()], None, &[], Duration::from_secs(300)).await?;
+            proc::run("ditto", ["-x".as_ref(), "-k".as_ref(), upload.as_os_str(), dest.as_os_str()], None, &[], timeout).await?;
         } else if magic[..n].starts_with(&[0x1f, 0x8b]) || (n > 262 && &magic[257..262] == b"ustar") {
-            proc::run("tar", ["-xf".as_ref(), upload.as_os_str(), "-C".as_ref(), dest.as_os_str()], None, &[], Duration::from_secs(300)).await?;
+            proc::run("tar", ["-xf".as_ref(), upload.as_os_str(), "-C".as_ref(), dest.as_os_str()], None, &[], timeout).await?;
         } else {
             return Err(ApiError::bad_request("upload a zip of the .app, an .ipa, or a tar(.gz) containing a .app"));
         }
-        let app = find_app(&dest, 3).ok_or_else(|| ApiError::bad_request("no .app bundle in the upload"))?;
-        let info = plist_to_json(&tokio::fs::read(app.join("Info.plist")).await.map_err(|_| ApiError::bad_request("the .app has no Info.plist"))?).await?;
-        let bundle = info["CFBundleIdentifier"].as_str().ok_or_else(|| ApiError::bad_request("Info.plist has no CFBundleIdentifier"))?.to_string();
-        simctl(&["install", &lease.udid, &app.to_string_lossy()]).await?;
-        Ok(Json(json!({
-            "bundle_id": bundle,
-            "name": info.get("CFBundleDisplayName").or(info.get("CFBundleName")),
-            "version": info.get("CFBundleShortVersionString"),
-            "build": info.get("CFBundleVersion"),
-        })))
+        let d = dest.clone();
+        blocking(move || make_writable(&d)).await?;
+        install_dir(&lease, &dest, bytes).await
     }
     .await;
     let _ = tokio::fs::remove_file(&upload).await;
-    let _ = tokio::fs::remove_dir_all(&dest).await;
+    let d = dest.clone();
+    let _ = blocking(move || remove_tree(&d)).await;
     res
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn install_timeout_grows_with_the_app() {
+        assert_eq!(install_timeout(0), Duration::from_secs(600));
+        assert_eq!(install_timeout(20 << 30), Duration::from_secs(600 + 10240));
+    }
+}
+
+/// Installs the .app found in `dir`. `bytes` is the app's size, for the timeout.
+pub async fn install_dir(lease: &Lease, dir: &FsPath, bytes: u64) -> ApiResult<Json<Value>> {
+    let app = find_app(dir, 3).ok_or_else(|| ApiError::bad_request("no .app bundle in the upload"))?;
+    let info = plist_to_json(&tokio::fs::read(app.join("Info.plist")).await.map_err(|_| ApiError::bad_request("the .app has no Info.plist"))?).await?;
+    let bundle = info["CFBundleIdentifier"].as_str().ok_or_else(|| ApiError::bad_request("Info.plist has no CFBundleIdentifier"))?.to_string();
+    simctl_timeout(&["install", &lease.udid, &app.to_string_lossy()], install_timeout(bytes)).await?;
+    Ok(Json(json!({
+        "bundle_id": bundle,
+        "name": info.get("CFBundleDisplayName").or(info.get("CFBundleName")),
+        "version": info.get("CFBundleShortVersionString"),
+        "build": info.get("CFBundleVersion"),
+    })))
 }
 
 fn find_app(dir: &FsPath, depth: u32) -> Option<PathBuf> {
@@ -301,7 +329,7 @@ async fn delete_files(L(lease): L, Query(q): Query<FilesQuery>) -> ApiResult<Sta
         if !q.recursive {
             return Err(ApiError::bad_request("that's a directory; pass recursive=true"));
         }
-        tokio::fs::remove_dir_all(&path).await?;
+        blocking(move || remove_tree(&path)).await?;
     } else {
         tokio::fs::remove_file(&path).await?;
     }

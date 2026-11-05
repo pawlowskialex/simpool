@@ -10,6 +10,8 @@ use std::path::{Path, PathBuf};
 pub struct Config {
     #[serde(default = "default_listen")]
     pub listen: SocketAddr,
+    /// Also serve on this Unix socket (mode 0600), e.g. to forward it with `ssh -R`.
+    pub listen_unix: Option<PathBuf>,
     /// Bearer tokens accepted by the API. Empty means no auth (only sensible on localhost).
     #[serde(default)]
     pub tokens: Vec<String>,
@@ -19,9 +21,12 @@ pub struct Config {
     /// A lease expires after this long without any request or renew.
     #[serde(default = "default_idle_ttl")]
     pub lease_idle_secs: u64,
-    /// Hard cap on a lease's lifetime, renewals included.
+    /// Hard cap on a lease's lifetime, renewals included. 0 means no cap.
     #[serde(default = "default_max_lease")]
     pub lease_max_secs: u64,
+    /// Disk for app files kept between installs. Least recently used files go first.
+    #[serde(default = "default_blob_cache_gb")]
+    pub blob_cache_gb: u64,
     /// How long an acquire waits in the queue by default.
     #[serde(default = "default_wait")]
     pub acquire_wait_secs: u64,
@@ -69,7 +74,10 @@ fn default_idle_ttl() -> u64 {
     600
 }
 fn default_max_lease() -> u64 {
-    4 * 3600
+    24 * 3600
+}
+fn default_blob_cache_gb() -> u64 {
+    20
 }
 fn default_wait() -> u64 {
     120
@@ -86,6 +94,7 @@ impl Config {
         let text = std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
         let mut cfg: Config = toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
         let base = path.parent().unwrap_or(Path::new("."));
+        cfg.listen_unix = cfg.listen_unix.map(|p| base.join(p));
         for (name, p) in &mut cfg.profiles {
             p.simfast_toml = match (&p.config, &p.inline) {
                 (Some(f), None) => {

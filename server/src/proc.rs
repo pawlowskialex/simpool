@@ -56,12 +56,21 @@ pub async fn simctl<S: AsRef<str>>(args: &[S]) -> Result<Output> {
 }
 
 pub async fn simctl_with<S: AsRef<str>>(args: &[S], stdin: Option<&[u8]>, envs: &[(String, String)]) -> Result<Output> {
+    simctl_full(args, stdin, envs, Duration::from_secs(120)).await
+}
+
+/// For the rare command whose duration depends on its input, like installing a huge app.
+pub async fn simctl_timeout<S: AsRef<str>>(args: &[S], timeout: Duration) -> Result<Output> {
+    simctl_full(args, None, &[], timeout).await
+}
+
+async fn simctl_full<S: AsRef<str>>(args: &[S], stdin: Option<&[u8]>, envs: &[(String, String)], timeout: Duration) -> Result<Output> {
     let mut all = vec!["simctl"];
     all.extend(args.iter().map(|a| a.as_ref()));
     // pbcopy/pbpaste and friends pick their text encoding from the locale.
     let mut envs = envs.to_vec();
     envs.push(("LC_ALL".into(), "en_US.UTF-8".into()));
-    run("xcrun", all, stdin, &envs, Duration::from_secs(120)).await.map_err(|e| anyhow!("{}", e.to_string().replacen("xcrun failed", "simctl failed", 1)))
+    run("xcrun", all, stdin, &envs, timeout).await.map_err(|e| anyhow!("{}", e.to_string().replacen("xcrun failed", "simctl failed", 1)))
 }
 
 /// Converts any plist (XML, binary or the old OpenStep text format simctl prints) to JSON.

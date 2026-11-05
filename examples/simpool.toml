@@ -1,17 +1,22 @@
 # simpoold config. Paths are relative to this file.
 
 listen = "0.0.0.0:7700"
+# Also serve on a Unix socket (mode 0600), to forward with `ssh -R` instead of opening a port.
+# listen_unix = "simpoold.sock"
 # Bearer tokens clients must send. Generate with `openssl rand -hex 24`.
 tokens = ["change-me"]
 
 # Simulators running at once on this Mac, across all profiles (~0.75 GB RAM each when slim).
 max_devices = 6
 # A lease expires after this long with no requests (open streams count as activity).
+# Clients can ask for longer with `simpool lease --ttl`.
 lease_idle_secs = 600
-# Hard cap on any lease, renewals included.
-lease_max_secs = 14400
+# Hard cap on any lease, renewals included. 0 means no cap.
+lease_max_secs = 86400
 # Default time a lease request waits in the queue when the pool is full.
 acquire_wait_secs = 120
+# Disk for app files kept between installs, so a reinstall only sends what changed.
+blob_cache_gb = 20
 
 # Let clients send their own simfast config (it must still match this Mac's pins).
 allow_client_configs = true

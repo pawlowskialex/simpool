@@ -1,3 +1,4 @@
+mod bundle;
 mod tunnel;
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -14,6 +15,7 @@ use std::path::{Path, PathBuf};
 #[derive(Parser)]
 #[command(version, max_term_width = 100)]
 struct Cli {
+    /// http(s)://host:port, or unix:///path/to.sock (e.g. one forwarded with `ssh -R`)
     #[arg(long, env = "SIMPOOL_URL", default_value = "http://127.0.0.1:7700", global = true)]
     server: String,
     #[arg(long, env = "SIMPOOL_TOKEN", global = true, hide_env_values = true)]
@@ -59,8 +61,18 @@ enum Cmd {
         #[arg(long)]
         ttl: Option<u64>,
     },
-    /// Install a .app (directory), .ipa, zip or tarball
-    Install { path: PathBuf },
+    /// Renew the lease until it's released or this is stopped; rides out network drops
+    Keepalive,
+    /// Install a .app (directory), .ipa, zip or tarball. A directory sends only what changed.
+    Install {
+        path: PathBuf,
+        /// A dSYM to send for debugging, repeatable. Those next to the app are found on their own.
+        #[arg(long)]
+        dsym: Vec<PathBuf>,
+        /// Don't look for dSYMs next to the app
+        #[arg(long)]
+        no_dsym: bool,
+    },
     Uninstall { bundle_id: String },
     /// Installed apps
     Apps {
@@ -250,7 +262,7 @@ enum Cmd {
         /// host:port to connect to locally
         local: String,
     },
-    /// Open the live view in a browser
+    /// Print the live view's URL, and open it when this is a Mac you're sitting at
     View,
     /// Call any API path: `api GET /ui` (lease-relative) or `api GET /v1/pool`
     Api {
@@ -350,19 +362,35 @@ impl Element {
 
 pub struct Client {
     http: reqwest::Client,
-    pub server: String,
+    /// What the user gave, for messages.
+    server: String,
+    /// Where URLs point. Over a Unix socket the host is only a formality.
+    base: String,
+    /// Connect through this socket instead of over TCP.
+    pub unix: Option<PathBuf>,
     pub token: Option<String>,
     lease: Option<String>,
 }
 
 impl Client {
+    fn new(server: String, token: Option<String>, lease: Option<String>) -> Result<Client> {
+        let unix = server.strip_prefix("unix:").map(|p| PathBuf::from(p.trim_start_matches("//")));
+        if let Some(p) = &unix {
+            if !p.is_absolute() {
+                bail!("{server}: a socket needs an absolute path, like unix:///tmp/simpool.sock");
+            }
+        }
+        let base = if unix.is_some() { "http://localhost".to_string() } else { server.trim_end_matches('/').to_string() };
+        Ok(Client { http: http_client(unix.as_deref())?, server, base, unix, token, lease })
+    }
+
     fn lease_path(&self, p: &str) -> Result<String> {
         let id = self.lease.as_deref().ok_or_else(|| anyhow!("no lease: pass --lease or export SIMPOOL_LEASE=$(simpool lease)"))?;
         Ok(format!("/v1/leases/{id}{p}"))
     }
 
     pub fn url(&self, path: &str) -> String {
-        format!("{}{path}", self.server.trim_end_matches('/'))
+        format!("{}{path}", self.base)
     }
 
     fn req(&self, method: Method, path: &str) -> reqwest::RequestBuilder {
@@ -410,6 +438,28 @@ impl Client {
             return Ok(Value::Null);
         }
         Ok(resp.json().await.unwrap_or(Value::Null))
+    }
+
+    /// Posts a manifest to `path`, sending whatever file contents the server asks for, until it
+    /// has them all and acts on the manifest. Normally that's at most two rounds; more only if
+    /// the server's store evicts files in between.
+    async fn send_bundle(&self, path: &str, scan: &bundle::Scan) -> Result<Value> {
+        for _ in 0..3 {
+            let reply = self.on(Method::POST, path, Some(scan.manifest.clone())).await?;
+            let Some(missing) = reply["missing"].as_array() else { return Ok(reply) };
+            let mut items = Vec::with_capacity(missing.len());
+            for hash in missing {
+                let hash = hash.as_str().unwrap_or_default();
+                let (file, size) = scan.blobs.get(hash).ok_or_else(|| anyhow!("the server asked for {hash}, which isn't in this bundle"))?;
+                items.push((hash.to_string(), file.clone(), *size));
+            }
+            let sending: u64 = items.iter().map(|i| i.2).sum();
+            let total: u64 = scan.blobs.values().map(|b| b.1).sum();
+            eprintln!("simpool: sending {} of {} files ({} of {})", items.len(), scan.blobs.len(), size_text(sending), size_text(total));
+            let body = reqwest::Body::wrap_stream(blob_frames(items));
+            self.send(self.req(Method::POST, &self.lease_path("/blobs")?).body(body)).await?;
+        }
+        bail!("the server keeps losing uploaded files; is blob_cache_gb too small for this app?")
     }
 
     async fn download(&self, path: &str, out: &Path) -> Result<u64> {
@@ -462,6 +512,169 @@ fn tokio_util_stream(f: tokio::fs::File) -> impl futures::Stream<Item = std::io:
     })
 }
 
+/// What POST /blobs reads: for each file, its hash and length, then its contents.
+fn blob_frames(items: Vec<(String, PathBuf, u64)>) -> impl futures::Stream<Item = std::io::Result<Vec<u8>>> {
+    use tokio::io::AsyncReadExt;
+    let current: Option<(tokio::fs::File, u64)> = None;
+    futures::stream::unfold((items.into_iter(), current), |(mut items, mut current)| async move {
+        loop {
+            if let Some((file, left)) = current.as_mut() {
+                if *left == 0 {
+                    current = None;
+                    continue;
+                }
+                let mut buf = vec![0u8; (*left).min(256 << 10) as usize];
+                return match file.read(&mut buf).await {
+                    Ok(0) => Some((Err(std::io::Error::other("a file got shorter during the upload")), (items, None))),
+                    Ok(n) => {
+                        buf.truncate(n);
+                        *left -= n as u64;
+                        Some((Ok(buf), (items, current)))
+                    }
+                    Err(e) => Some((Err(e), (items, None))),
+                };
+            }
+            let (hash, path, size) = items.next()?;
+            let file = match tokio::fs::File::open(&path).await {
+                Ok(f) => f,
+                Err(e) => return Some((Err(std::io::Error::other(format!("opening {}: {e}", path.display()))), (items, None))),
+            };
+            let mut header = Vec::with_capacity(40);
+            for i in (0..64).step_by(2) {
+                header.push(u8::from_str_radix(&hash[i..i + 2], 16).unwrap_or(0));
+            }
+            header.extend_from_slice(&size.to_be_bytes());
+            return Some((Ok(header), (items, Some((file, size)))));
+        }
+    })
+}
+
+fn size_text(bytes: u64) -> String {
+    match bytes {
+        b if b >= 1 << 30 => format!("{:.1} GB", b as f64 / (1u64 << 30) as f64),
+        b if b >= 1 << 20 => format!("{:.1} MB", b as f64 / (1u64 << 20) as f64),
+        b if b >= 1 << 10 => format!("{:.1} KB", b as f64 / (1u64 << 10) as f64),
+        b => format!("{b} bytes"),
+    }
+}
+
+#[cfg(unix)]
+fn http_client(unix: Option<&Path>) -> Result<reqwest::Client> {
+    let mut b = reqwest::Client::builder();
+    if let Some(sock) = unix {
+        b = b.unix_socket(sock);
+    }
+    Ok(b.build()?)
+}
+
+#[cfg(not(unix))]
+fn http_client(unix: Option<&Path>) -> Result<reqwest::Client> {
+    if unix.is_some() {
+        bail!("Unix sockets aren't available on this platform");
+    }
+    Ok(reqwest::Client::new())
+}
+
+/// Scans a bundle off the async runtime; hashing a big app takes a moment.
+async fn scan_bundle(path: &Path) -> Result<bundle::Scan> {
+    let name = bundle::bundle_name(path)?;
+    let path = path.to_path_buf();
+    tokio::task::spawn_blocking(move || bundle::scan(&path, &name)).await?
+}
+
+async fn install(c: &Client, path: &Path, dsym: Vec<PathBuf>, no_dsym: bool) -> Result<()> {
+    let installed = if path.is_dir() {
+        let scan = scan_bundle(path).await?;
+        c.send_bundle("/apps/manifest", &scan).await?
+    } else {
+        c.upload("/apps", path).await?
+    };
+    print(&installed);
+    let bundle_id = installed["bundle_id"].as_str().ok_or_else(|| anyhow!("the server didn't say which app it installed"))?;
+    let mut dsyms = dsym;
+    if !no_dsym {
+        for found in bundle::find_dsyms(path) {
+            if !dsyms.contains(&found) {
+                dsyms.push(found);
+            }
+        }
+        if dsyms.is_empty() {
+            eprintln!("simpool: no dSYM next to {}, so the debugger on the server has no symbols for it. Build one (Xcode: dwarf-with-dsym; Bazel: --apple_generate_dsym) or pass --dsym.", path.display());
+        }
+    }
+    // The app is in already, so a dSYM that can't be placed only costs debugging. Say so and go on.
+    let mut failed = None;
+    for d in dsyms {
+        let sent = async {
+            let scan = scan_bundle(&d).await?;
+            c.send_bundle(&format!("/apps/{bundle_id}/dsyms"), &scan).await
+        };
+        match sent.await {
+            Ok(_) => eprintln!("simpool: added {}", d.display()),
+            Err(e) => {
+                eprintln!("simpool: couldn't add {}: {e:#}", d.display());
+                failed = Some(d);
+            }
+        }
+    }
+    match failed {
+        Some(d) => bail!("{} was installed, but without {}", path.display(), d.display()),
+        None => Ok(()),
+    }
+}
+
+/// Renews often enough to survive a couple of failed attempts. Only a lease that's really gone ends it.
+async fn keepalive(c: &Client) -> Result<()> {
+    let path = c.lease_path("/renew")?;
+    let mut wait = std::time::Duration::from_secs(30);
+    loop {
+        match c.req(Method::POST, &path).send().await {
+            Ok(resp) if resp.status() == StatusCode::NOT_FOUND => bail!("the lease is gone (released or expired)"),
+            Ok(resp) if resp.status().is_success() => {
+                let lease: Value = resp.json().await.unwrap_or(Value::Null);
+                let idle = lease["idle_timeout_secs"].as_u64().unwrap_or(600);
+                wait = std::time::Duration::from_secs((idle / 3).clamp(5, 300));
+            }
+            Ok(resp) => eprintln!("simpool: couldn't renew ({}), will retry", resp.status()),
+            Err(e) => eprintln!("simpool: couldn't reach {}, will retry: {e}", c.server),
+        }
+        tokio::select! {
+            _ = tokio::time::sleep(wait) => {}
+            _ = tokio::signal::ctrl_c() => return Ok(()),
+        }
+    }
+}
+
+async fn view(c: &Client) -> Result<()> {
+    let mut path = c.lease_path("/view")?;
+    if let Some(t) = &c.token {
+        path += &format!("?token={}", q(t));
+    }
+    #[cfg(unix)]
+    if let Some(sock) = c.unix.clone() {
+        // A browser can't use a Unix socket, so offer it a local port for as long as this runs.
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await?;
+        println!("http://127.0.0.1:{}{path}", listener.local_addr()?.port());
+        if let Some(listen) = c.json(Method::GET, "/v1/pool", None).await?["listen"].as_str() {
+            let host = listen.replace("0.0.0.0", "127.0.0.1").replace("[::]", "127.0.0.1");
+            eprintln!("simpool: that URL works on this machine. On the server's own machine, use http://{host}{path}");
+        }
+        eprintln!("simpool: Ctrl-C ends the view");
+        tokio::select! {
+            r = tunnel::serve_socket_proxy(listener, sock) => r?,
+            _ = tokio::signal::ctrl_c() => {}
+        }
+        return Ok(());
+    }
+    let url = c.url(&path);
+    println!("{url}");
+    let at_the_mac = cfg!(target_os = "macos") && std::env::var_os("SSH_CONNECTION").is_none();
+    if at_the_mac {
+        let _ = std::process::Command::new("open").arg(&url).status();
+    }
+    Ok(())
+}
+
 fn print(v: &Value) {
     match v {
         Value::Null => {}
@@ -507,7 +720,7 @@ async fn input(c: &Client, actions: Value) -> Result<Value> {
 }
 
 async fn run(cli: Cli) -> Result<()> {
-    let c = Client { http: reqwest::Client::new(), server: cli.server, token: cli.token, lease: cli.lease };
+    let c = Client::new(cli.server, cli.token, cli.lease)?;
     use Method as M;
     match cli.cmd {
         Cmd::Status => print(&c.json(M::GET, "/v1/pool", None).await?),
@@ -533,22 +746,8 @@ async fn run(cli: Cli) -> Result<()> {
             eprintln!("simpool: released");
         }
         Cmd::Renew { ttl } => print(&c.on(M::POST, "/renew", Some(json!({"ttl_secs": ttl}))).await?),
-        Cmd::Install { path } => {
-            let (file, _tmp) = if path.is_dir() {
-                // A bare .app: zip it the way Finder would.
-                let dir = std::env::temp_dir().join(format!("simpool-{}", std::process::id()));
-                std::fs::create_dir_all(&dir)?;
-                let zip = dir.join("app.zip");
-                let st = std::process::Command::new("ditto").args(["-c", "-k", "--keepParent"]).arg(&path).arg(&zip).status().context("running ditto")?;
-                if !st.success() {
-                    bail!("zipping {} failed", path.display());
-                }
-                (zip, Some(TempDir(dir)))
-            } else {
-                (path.clone(), None)
-            };
-            print(&c.upload("/apps", &file).await?);
-        }
+        Cmd::Keepalive => keepalive(&c).await?,
+        Cmd::Install { path, dsym, no_dsym } => install(&c, &path, dsym, no_dsym).await?,
         Cmd::Uninstall { bundle_id } => c.on(M::DELETE, &format!("/apps/{bundle_id}"), None).await.map(drop)?,
         Cmd::Apps { user } => {
             let v = c.on(M::GET, &format!("/apps?user={user}"), None).await?;
@@ -685,16 +884,7 @@ async fn run(cli: Cli) -> Result<()> {
             eprintln!("simpool: simulator Mac 127.0.0.1:{remote_port} -> {local}");
             tunnel::serve_reverse(&c, c.lease_path(&format!("/reverse?port={remote_port}"))?, &local).await?;
         }
-        Cmd::View => {
-            let mut url = c.url(&c.lease_path("/view")?);
-            if let Some(t) = &c.token {
-                url += &format!("?token={}", q(t));
-            }
-            println!("{url}");
-            if cfg!(target_os = "macos") {
-                let _ = std::process::Command::new("open").arg(&url).status();
-            }
-        }
+        Cmd::View => view(&c).await?,
         Cmd::Api { method, path, body } => {
             let m = Method::from_bytes(method.to_uppercase().as_bytes())?;
             let path = if path.starts_with("/v1") || path == "/healthz" { path } else { c.lease_path(&path)? };
@@ -738,11 +928,4 @@ async fn files(c: &Client, cmd: FilesCmd) -> Result<()> {
         }
     }
     Ok(())
-}
-
-struct TempDir(PathBuf);
-impl Drop for TempDir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
 }

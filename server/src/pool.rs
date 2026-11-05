@@ -3,6 +3,7 @@
 use crate::bridge::Bridge;
 use crate::config::Config;
 use crate::error::{ApiError, ApiResult};
+use crate::fsutil::remove_tree;
 use crate::proc;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
@@ -15,6 +16,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::process::Child;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio_util::sync::CancellationToken;
+
+/// The longest idle timeout a client can ask for. Beyond some size, adding it to a clock panics.
+const MAX_TTL: Duration = Duration::from_secs(10 * 365 * 24 * 3600);
 
 pub struct Pool {
     pub cfg: Config,
@@ -36,7 +40,8 @@ pub struct Lease {
     pub created: SystemTime,
     started: Instant,
     idle: Duration,
-    hard_deadline: Instant,
+    /// From lease_max_secs; None when the server sets no cap.
+    hard_deadline: Option<Instant>,
     deadline: Mutex<Instant>,
     /// Scratch space for uploads, recordings and captured app output; removed on release.
     pub dir: PathBuf,
@@ -82,7 +87,7 @@ pub struct AcquireRequest {
     pub profile: Option<String>,
     /// Or a whole simfast config (if the server allows it).
     pub simfast_config: Option<String>,
-    /// Idle timeout for this lease (capped by the server's lease_idle_secs * 4).
+    /// Idle timeout for this lease, instead of the server's lease_idle_secs. lease_max_secs still applies.
     pub ttl_secs: Option<u64>,
     /// How long to wait in the queue for capacity. 0 = fail immediately when full.
     pub wait_secs: Option<u64>,
@@ -119,6 +124,11 @@ impl Pool {
         self.cfg.data_dir().join("leases.json")
     }
 
+    /// App files kept between installs, shared by every lease. See api/bundles.rs.
+    pub fn blob_store(&self) -> PathBuf {
+        self.cfg.data_dir().join("blobs")
+    }
+
     fn persist(&self) {
         let list: Vec<Persisted> = self.leases.lock().unwrap().values().map(|l| Persisted { id: l.id.clone(), udid: l.udid.clone() }).collect();
         let tmp = self.state_file().with_extension("tmp");
@@ -134,7 +144,7 @@ impl Pool {
         for p in old {
             tracing::info!(lease = %p.id, udid = %p.udid, "stopping simulator left over from the last run");
             let _ = self.simfast_stop(&p.udid).await;
-            let _ = std::fs::remove_dir_all(self.cfg.data_dir().join("leases").join(&p.id));
+            let _ = remove_tree(&self.cfg.data_dir().join("leases").join(&p.id));
         }
         self.persist();
     }
@@ -182,8 +192,12 @@ impl Pool {
         let id = uuid::Uuid::new_v4().simple().to_string();
         let dir = self.cfg.data_dir().join("leases").join(&id);
         std::fs::create_dir_all(&dir)?;
-        let idle = Duration::from_secs(req.ttl_secs.unwrap_or(self.cfg.lease_idle_secs).clamp(30, self.cfg.lease_idle_secs * 4));
+        let idle = Duration::from_secs(req.ttl_secs.unwrap_or(self.cfg.lease_idle_secs)).clamp(Duration::from_secs(30), MAX_TTL);
         let now = Instant::now();
+        let hard_deadline = match self.cfg.lease_max_secs {
+            0 => None,
+            secs => now.checked_add(Duration::from_secs(secs)),
+        };
         let lease = Arc::new(Lease {
             id: id.clone(),
             udid,
@@ -192,8 +206,8 @@ impl Pool {
             created: SystemTime::now(),
             started: now,
             idle,
-            hard_deadline: now + Duration::from_secs(self.cfg.lease_max_secs),
-            deadline: Mutex::new(now + idle),
+            hard_deadline,
+            deadline: Mutex::new(hard_deadline.map_or(now + idle, |h| h.min(now + idle))),
             dir,
             cancel: CancellationToken::new(),
             bridge: tokio::sync::Mutex::new(None),
@@ -262,7 +276,9 @@ impl Pool {
         if let Err(e) = self.simfast_stop(&lease.udid).await {
             tracing::warn!(lease = %id, "simfast stop {}: {e:#}", lease.udid);
         }
-        let _ = std::fs::remove_dir_all(&lease.dir);
+        if let Err(e) = remove_tree(&lease.dir) {
+            tracing::warn!(lease = %id, "removing {}: {e}", lease.dir.display());
+        }
         tracing::info!(lease = %id, udid = %lease.udid, "released ({why}) after {}s", lease.started.elapsed().as_secs());
         Ok(())
         // The permits drop with the last Arc<Lease>, which frees the slot.
@@ -286,7 +302,7 @@ impl Pool {
                 .unwrap()
                 .values()
                 .filter_map(|l| {
-                    if now >= l.hard_deadline {
+                    if l.hard_deadline.is_some_and(|h| now >= h) {
                         Some((l.id.clone(), "reached lease_max_secs"))
                     } else if now >= *l.deadline.lock().unwrap() && l.streams.load(Ordering::SeqCst) == 0 {
                         Some((l.id.clone(), "idle timeout"))
@@ -313,6 +329,7 @@ impl Pool {
             })
             .collect();
         json!({
+            "listen": self.cfg.listen,
             "max_devices": self.cfg.max_devices,
             "leased": leases.len(),
             "available": self.global.available_permits(),
@@ -328,8 +345,11 @@ impl Pool {
 impl Lease {
     /// Pushes the idle deadline out (by `ttl` or the lease's own idle timeout).
     pub fn touch(&self, ttl: Option<Duration>) {
+        let mut next = Instant::now() + ttl.unwrap_or(self.idle).min(MAX_TTL);
+        if let Some(hard) = self.hard_deadline {
+            next = next.min(hard);
+        }
         let mut d = self.deadline.lock().unwrap();
-        let next = (Instant::now() + ttl.unwrap_or(self.idle)).min(self.hard_deadline);
         if next > *d {
             *d = next;
         }
@@ -346,7 +366,7 @@ impl Lease {
             "created_at": unix(self.created),
             "expires_at": unix(SystemTime::now() + left),
             "idle_timeout_secs": self.idle.as_secs(),
-            "max_expires_at": unix(SystemTime::now() + self.hard_deadline.saturating_duration_since(now)),
+            "max_expires_at": self.hard_deadline.map(|h| unix(SystemTime::now() + h.saturating_duration_since(now))),
         })
     }
 

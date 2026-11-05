@@ -1,4 +1,5 @@
 mod apps;
+mod bundles;
 mod device;
 mod input;
 mod logs;
@@ -31,6 +32,7 @@ pub fn router(pool: AppState) -> Router {
         .route("/", get(lease_info).delete(release))
         .route("/renew", post(renew))
         .merge(apps::routes())
+        .merge(bundles::routes())
         .merge(device::routes())
         .merge(input::routes())
         .merge(screen::routes())
